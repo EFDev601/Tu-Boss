@@ -4,7 +4,7 @@ const udp = require('dgram');
 
 const server = udp.createSocket("udp4");
 var clients = new Map();
-var lobbies = [];
+var lobbies = new Map();
 var games = [];
 
 ///UTILITY FUNCTIONS///
@@ -24,7 +24,7 @@ function validateMessage(data){
 }
 
 ///SERVER MESSAGE EVENTS///
-const ServerEvent = {connect: "connect", createLobby: "create-lobby", joinLobby: "join-lobby", endGame: "end-game"}
+const ServerEvent = {connect: "connect", createLobby: "create-lobby", joinLobby: "join-lobby", randomQueue: "random-queue", endGame: "end-game"}
 function server_connect(data){
     //Assign an ID and add player to listing
     var uuid = randomUUID();
@@ -36,29 +36,51 @@ function server_connect(data){
     server.send("server|server|connected|" + uuid, data.client.port, data.client.ip);
 }
 
+const codeChars = '0123456789abcdefghijklmnopqrstuvwxyz';
 function server_create_lobby(data){
-    lobbies.push(data.id);
+    var lobbyCode = "";
 
-    server.send("server|server|lobby-created|Lobby Created Successfully", data.client.port, data.client.id);
+    for (var i = 0; i < 6; i++){
+        lobbyCode += codeChars[Math.floor(Math.random() * codeChars.length)];
+    }
+
+    lobbies.set(lobbyCode, data.id);
+
+    server.send("server|server|lobby-created|" + lobbyCode, data.client.port, data.client.id);
 
     console.log(data.client.name + " has created a lobby");
 }
 
 function server_join_lobby(data){
-    var index = lobbies.indexOf(data.message.text);
-    if (index == -1){
+    if (!lobbies.has(data.message.text)){
         server.send("server|server|error-lobby-join|Lobby is either full or does not exist", data.client.port, data.client.id);
         return;
     }
 
-    lobbies.splice(index, 1);
+    var playerID = lobbies.get(data.message.text);
+    lobbies.delete(data.message.text);
 
-    games.push([data.message.text, data.id]);
+    games.push([playerID, data.id]);
 
     server.send("server|server|start-game|Lobby Joined Successfully", data.client.port, data.client.ip);
-    server.send("server|server|start-game|Player Joined Lobby", clients.get(data.message.text).port, clients.get(data.message.text).ip);
+    server.send("server|server|start-game|Player Joined Lobby", clients.get(playerID).port, clients.get(playerID).ip);
 
-    console.log("Game started between: " + clients.get(data.message.text).name + " and " + data.client.name);
+    console.log("Game started between: " + clients.get(playerID).name + " and " + data.client.name);
+}
+
+var queue = null;
+function randomQueue(data){
+    if (queue == null){
+        queue = data.id;
+    }
+    else{
+        games.push([queue, data.id]);
+
+        server.send("server|server|start-game|Opponent Found", data.client.port, data.client.ip);
+        server.send("server|server|start-game|Opponent Found", clients.get(queue).port, clients.get(queue).ip);
+
+        queue = null;
+    }
 }
 
 function server_end_game(data){
