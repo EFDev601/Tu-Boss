@@ -1,4 +1,3 @@
-
 const { randomUUID } = require('crypto');
 const udp = require('dgram');
 
@@ -13,7 +12,7 @@ function parseMessage(msg, ip, port){
     var parsedMsg = msg.toString().split("|");
     if (parsedMsg.length != 4) return null;
     return {id: parsedMsg[0], 
-            client:{ip:ip, port:port, name:parsedMsg[1]}, 
+            client:{ip:ip, port:port, name:parsedMsg[1], lastPacket:Date.now()}, 
             message:{event: parsedMsg[2], text: parsedMsg[3]}}
 }
 
@@ -23,8 +22,43 @@ function validateMessage(data){
     return false;
 }
 
+//Timeout
+setInterval(function () {
+    if (clients.size > 0){
+        let v = clients.values();
+        let k = clients.keys();
+        for (let i = 0; i < clients.size; i++) {
+            //5 min
+            var client = v.next().value;
+            var key = k.next().value;
+            if (client.lastPacket + 5000/*300000*/ < Date.now()){
+                client_disconnect(client, key);
+            }
+        }
+    }
+    if (games.length > 0) {
+        for (let i = 0; i < games.length; i++) {
+            //5 seconds
+            if (clients.get(games[i][0]).lastPacket + 5000 < Date.now()){
+                server.send("server|server|opponent-disconnect|Opponent has disconected", clients.get(games[i][1]).port, clients.get(games[i][1]).ip);
+                
+                client_disconnect(clients.get(games[i][0]), games[i][0]);
+
+                games.splice(i, 1);
+            }
+            if (clients.get(games[i][1]).lastPacket + 5000 < Date.now()){
+                server.send("server|server|opponent-disconnect|Opponent has disconected", clients.get(games[i][0]).port, clients.get(games[i][0]).ip);
+                    
+                client_disconnect(clients.get(games[i][1]), games[i][1]);
+
+                games.splice(i, 1);
+            }
+        }
+    }
+}, 1000);
+
 ///SERVER MESSAGE EVENTS///
-const ServerEvent = {connect: "connect", createLobby: "create-lobby", joinLobby: "join-lobby", randomQueue: "random-queue", endGame: "end-game"}
+const ServerEvent = {connect: "connect", createLobby: "create-lobby", joinLobby: "join-lobby", randomQueue: "random-queue", endGame: "end-game", update:"update"}
 function server_connect(data){
     //Assign an ID and add player to listing
     var uuid = randomUUID();
@@ -104,6 +138,39 @@ function server_end_game(data){
     }
 }
 
+function server_update(data){
+    for (let i = 0; i < games.length; i++) {
+        if (games[i][0] == data.id){
+            server.send("server|" + data.client.name + "|update|" + data.message.text, clients.get(games[i][1]).port, clients.get(games[i][1]).ip);
+            break;
+        }
+        if (games[i][1] == data.id){
+            server.send("server|" + data.client.name + "|update|" + data.message.text, clients.get(games[i][0]).port, clients.get(games[i][0]).ip);
+            break;
+        }
+    }
+}
+
+function client_disconnect(client, id){
+    console.log("Client " + id + " has disconnected");
+    server.send("server|server|disconnected|Your connection has timed out", client.port, client.ip);
+    
+    if (lobbies.size > 0){
+        var v = lobbies.values();
+        var k = lobbies.keys();
+        for (let i = 0; i < lobbies.size; i++) {
+            var lobby = v.next().value;
+            var key = k.next().value;
+            if (lobby == id){
+                lobbies.delete(key);
+                break;
+            }
+        }
+    }
+
+    clients.delete(id);
+}
+
 ///SERVER EVENTS///
 server.on('error', (e) => {
     console.log('server error: ' + e.stack);
@@ -115,6 +182,7 @@ server.on('message', (msg, rinfo) => {
     
     if (validateMessage(parsedMsg)){
         //Server Events
+        clients.get(parsedMsg.id).lastPacket = Date.now();
         switch(parsedMsg.message.event){
             case ServerEvent.createLobby:
                 server_create_lobby(parsedMsg);
@@ -123,7 +191,10 @@ server.on('message', (msg, rinfo) => {
                 server_join_lobby(parsedMsg);
                 break;
             case ServerEvent.endGame:
-
+                server_end_game(parsedMsg);
+            case ServerEvent.update:
+                server_update(parsedMsg);
+                break;
             default:
                 break;
         }
