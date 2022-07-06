@@ -1,10 +1,12 @@
 const { randomUUID } = require('crypto');
 const udp = require('dgram');
+const { Server } = require('http');
 
 const server = udp.createSocket("udp4");
 var clients = new Map();
 var lobbies = new Map();
 var games = [];
+var rematches = [];
 
 ///UTILITY FUNCTIONS///
 function parseMessage(msg, ip, port){
@@ -12,7 +14,7 @@ function parseMessage(msg, ip, port){
     var parsedMsg = msg.toString().split("|");
     if (parsedMsg.length != 4) return null;
     return {id: parsedMsg[0], 
-            client:{ip:ip, port:port, name:parsedMsg[1], lastPacket:Date.now()}, 
+            client:{ip:ip, port:port, name:parsedMsg[1], lastPacket:Date.now(), inGame: false}, 
             message:{event: parsedMsg[2], text: parsedMsg[3]}}
 }
 
@@ -31,34 +33,38 @@ setInterval(function () {
             //5 min
             var client = v.next().value;
             var key = k.next().value;
-            if (client.lastPacket + 5000/*300000*/ < Date.now()){
+            if (client.lastPacket + 300000 < Date.now()){
                 client_disconnect(client, key);
             }
         }
     }
     if (games.length > 0) {
+        var gameOffset = 0;
         for (let i = 0; i < games.length; i++) {
             //5 seconds
-            if (clients.get(games[i][0]).lastPacket + 5000 < Date.now()){
-                server.send("server|server|opponent-disconnect|Opponent has disconected", clients.get(games[i][1]).port, clients.get(games[i][1]).ip);
+            var j = i - gameOffset;
+            if (clients.get(games[j].player1).lastPacket + 5000 < Date.now()){
+                server.send("server|server|opponent-disconnect|Opponent has disconected", clients.get(games[j].player2).port, clients.get(games[j].player2).ip);
                 
-                client_disconnect(clients.get(games[i][0]), games[i][0]);
+                client_disconnect(clients.get(games[j].player1), games[i].player1);
+                gameOffset--;
 
-                games.splice(i, 1);
+                continue;
             }
-            if (clients.get(games[i][1]).lastPacket + 5000 < Date.now()){
-                server.send("server|server|opponent-disconnect|Opponent has disconected", clients.get(games[i][0]).port, clients.get(games[i][0]).ip);
+            if (clients.get(games[j].player2).lastPacket + 5000 < Date.now()){
+                server.send("server|server|opponent-disconnect|Opponent has disconected", clients.get(games[j].player1).port, clients.get(games[j].player1).ip);
                     
-                client_disconnect(clients.get(games[i][1]), games[i][1]);
+                client_disconnect(clients.get(games[j].player2), games[j].player2);
+                gameOffset--;
 
-                games.splice(i, 1);
+                continue;
             }
         }
     }
 }, 1000);
 
 ///SERVER MESSAGE EVENTS///
-const ServerEvent = {connect: "connect", createLobby: "create-lobby", joinLobby: "join-lobby", randomQueue: "random-queue", endGame: "end-game", update:"update"}
+const ServerEvent = {connect: "connect", createLobby: "create-lobby", joinLobby: "join-lobby", randomQueue: "random-queue", endGame: "end-game", update:"update", cancel: "cancel", rematch: "rematch"}
 function server_connect(data){
     //Assign an ID and add player to listing
     var uuid = randomUUID();
@@ -80,26 +86,53 @@ function server_create_lobby(data){
 
     lobbies.set(lobbyCode, data.id);
 
-    server.send("server|server|lobby-created|" + lobbyCode, data.client.port, data.client.id);
+    server.send("server|server|lobby-created|" + lobbyCode, data.client.port, data.client.ip);
 
     console.log(data.client.name + " has created a lobby");
 }
 
 function server_join_lobby(data){
     if (!lobbies.has(data.message.text)){
-        server.send("server|server|error-lobby-join|Lobby is either full or does not exist", data.client.port, data.client.id);
+        server.send("server|server|error-lobby-join|Lobby is either full or does not exist", data.client.port, data.client.ip);
         return;
     }
 
     var playerID = lobbies.get(data.message.text);
     lobbies.delete(data.message.text);
 
-    games.push([playerID, data.id]);
+    games.push({player1: playerID, player2: data.id});
 
-    server.send("server|server|start-game|Lobby Joined Successfully", data.client.port, data.client.ip);
-    server.send("server|server|start-game|Player Joined Lobby", clients.get(playerID).port, clients.get(playerID).ip);
+    clients.get(playerID).lastPacket = Date.now();
+    clients.get(data.id).lastPacket = Date.now();
+
+    server.send("server|server|start-game|" + clients.get(playerID).name, data.client.port, data.client.ip);
+    server.send("server|server|start-game|" + data.client.name, clients.get(playerID).port, clients.get(playerID).ip);
+
+    setTimeout(() => {server_pursue_connection(playerID);}, 1000);
+    setTimeout(() => {server_pursue_connection(data.id);}, 1000);
 
     console.log("Game started between: " + clients.get(playerID).name + " and " + data.client.name);
+}
+
+function server_pursue_connection(id){
+    if (games.length > 0){
+        for (let i = 0; i < games.length; i++) {
+            if (games[i].player1 == id && !clients.get(id).inGame){
+                //Part of game, no confirmed connection
+                console.log("Connection failed with " + id + ", attempting to pursue");
+                server.send("server|server|start-game|" + clients.get(games[i].player2).name, clients.get(id).port, clients.get(id).ip);
+                setTimeout(() => {server_pursue_connection(id)}, 1000);
+                return;
+            }
+            if (games[i].player2 == id && !clients.get(id).inGame){
+                //Part of game, no confirmed connection
+                console.log("Connection failed with " + id + ", attempting to pursue");
+                server.send("server|server|start-game|" + clients.get(games[i].player1).name, clients.get(id).port, clients.get(id).ip);
+                setTimeout(() => {server_pursue_connection(id)}, 1000);
+                return;
+            }
+        }
+    }
 }
 
 var queue = null;
@@ -108,46 +141,132 @@ function randomQueue(data){
         queue = data.id;
     }
     else{
-        games.push([queue, data.id]);
+        games.push({player1: queue, player2: data.id});
 
-        server.send("server|server|start-game|Opponent Found", data.client.port, data.client.ip);
-        server.send("server|server|start-game|Opponent Found", clients.get(queue).port, clients.get(queue).ip);
+        clients.get(queue).lastPacket = Date.now();
+        clients.get(data.id).lastPacket = Date.now();
+        
+        server.send("server|server|start-game|" + clients.get(queue).name, data.client.port, data.client.ip);
+        server.send("server|server|start-game|" + data.client.name, clients.get(queue).port, clients.get(queue).ip);
+
+        setTimeout(() => {server_pursue_connection(queue);}, 1000);
+        setTimeout(() => {server_pursue_connection(data.id);}, 1000);
+
+        console.log("Game started between: " + clients.get(queue).name + " and " + data.client.name);
 
         queue = null;
     }
 }
 
 function server_end_game(data){
-    var try1 = games.indexOf([data.id, data.message.text]);
-    var try2 = games.indexOf([data.message.text, data.id]);
-
-    if (try1 == -1){
-        //try2
-        if (try2 == -1){
-            //Error
-            return;
+    var index = -1;
+    for (let i = 0; i < games.length; i++) {
+        if (games[i].player1 == data.id){
+            index = i;
+            server.send("server|server|end-game|You Win", clients.get(games[i].player2).port, clients.get(games[i].player2).ip);
+            rematches.push({winner: games[i].player2, loser: games[i].player1});
         }
-        games.splice(try2, 1);
+        if (games[i].player2 == data.id){
+            index = i;
+            server.send("server|server|end-game|You Win", clients.get(games[i].player1).port, clients.get(games[i].player1).ip);
+            rematches.push({winner: games[i].player1, loser: games[i].player2, winConfirm: false, loseConfirm: false});
+        }
     }
-    else if (try2 == -1){
-        //Error
-        return;
-    }
-    else{
-        games.splice(try1, 1);
+
+    if (index != -1){
+        games.splice(index, 1);
     }
 }
 
 function server_update(data){
     for (let i = 0; i < games.length; i++) {
-        if (games[i][0] == data.id){
-            server.send("server|" + data.client.name + "|update|" + data.message.text, clients.get(games[i][1]).port, clients.get(games[i][1]).ip);
+        if (games[i].player1 == data.id){
+            clients.get(data.id).inGame = true;
+            server.send("server|" + data.client.name + "|update|" + data.message.text, clients.get(games[i].player2).port, clients.get(games[i].player2).ip);
+            return;
+        }
+        if (games[i].player2 == data.id){
+            clients.get(data.id).inGame = true;
+            server.send("server|" + data.client.name + "|update|" + data.message.text, clients.get(games[i].player1).port, clients.get(games[i].player1).ip);
+            return;
+        }
+    }
+}
+
+function server_cancel(data){
+    if (queue == data.id) {
+        console.log("Removed " + data.id + " from queue");
+        queue = null;
+    }
+
+    var v = lobbies.values();
+    var k = lobbies.keys();
+    for (let i = 0; i < lobbies.size; i++) {
+        var value = v.next().value;
+        var key = k.next().value;
+        if (value == data.id){
+            console.log("Removed " + data.id + " from lobby");
+            lobbies.delete(key);
             break;
         }
-        if (games[i][1] == data.id){
-            server.send("server|" + data.client.name + "|update|" + data.message.text, clients.get(games[i][0]).port, clients.get(games[i][0]).ip);
-            break;
+    }
+
+    for (let i = 0; i < games.length; i++) {
+        if (data.id == games[i].player1 || data.id == games[i].player2){
+            server.send("server|server|opponent-disconnect|Opponent Left", clients.get(games[i].player1).port, clients.get(games[i].player1).ip);
+            server.send("server|server|opponent-disconnect|Opponent Left", clients.get(games[i].player2).port, clients.get(games[i].player2).ip);
+            games.splice(i, 1);
         }
+    }
+
+    for (let i = 0; i < rematches.length; i++) {
+        if (data.id == rematches[i].winner || data.id == rematches[i].loser){
+            server.send("server|server|opponent-disconnect|opponent refused rematch", clients.get(rematches[i].winner).port, clients.get(rematches[i].winner).ip);
+            server.send("server|server|opponent-disconnect|opponent refused rematch", clients.get(rematches[i].loser).port, clients.get(rematches[i].loser).ip);
+            rematches.splice(i, 1);
+        }
+    }
+}
+
+function server_rematch(data){
+    var existingMatch = false;
+    for (let i = 0; i < rematches.length; i++) {
+        if (data.id == rematches[i].winner){
+            console.log(data.client.name + " wants a rematch");
+            rematches[i].winConfirm = true;
+            server.send("server|server|rematch|" + clients.get(rematches[i].winner).name + " wants a rematch", clients.get(rematches[i].loser).port, clients.get(rematches[i].loser).ip);
+            existingMatch = true;
+        }
+        if (data.id == rematches[i].loser){
+            console.log(data.client.name + " wants a rematch");
+            rematches[i].loseConfirm = true;
+            server.send("server|server|rematch|" + clients.get(rematches[i].loser).name + " wants a rematch", clients.get(rematches[i].winner).port, clients.get(rematches[i].winner).ip);
+            existingMatch = true;
+        }
+        if (rematches[i].winConfirm && rematches[i].loseConfirm){
+            games.push({player1: rematches[i].winner, player2: rematches[i].loser});
+
+            clients.get(rematches[i].winner).lastPacket = Date.now();
+            clients.get(rematches[i].loser).lastPacket = Date.now();
+            
+            server.send("server|server|start-game|" + clients.get(rematches[i].winner).name, clients.get(rematches[i].loser).port, clients.get(rematches[i].loser).ip);
+            server.send("server|server|start-game|" + clients.get(rematches[i].loser).name, clients.get(rematches[i].winner).port, clients.get(rematches[i].winner).ip);
+
+            var id1 = rematches[i].winner;
+            var id2 = rematches[i].loser;
+
+            setTimeout(() => {server_pursue_connection(id1);}, 1000);
+            setTimeout(() => {server_pursue_connection(id2);}, 1000);
+
+            console.log("Game started between: " + clients.get(rematches[i].winner).name + " and " + clients.get(rematches[i].loser).name);
+
+            rematches.splice(i, 1);
+        }
+    }
+
+    if (!existingMatch){
+        console.log("Error With Rematch");
+        server.send("server|server|opponent-disconnect|Opponent refused rematch", data.client.port, data.client.ip);
     }
 }
 
@@ -155,6 +274,8 @@ function client_disconnect(client, id){
     console.log("Client " + id + " has disconnected");
     server.send("server|server|disconnected|Your connection has timed out", client.port, client.ip);
     
+    if (queue == id) queue = null;
+
     if (lobbies.size > 0){
         var v = lobbies.values();
         var k = lobbies.keys();
@@ -163,6 +284,28 @@ function client_disconnect(client, id){
             var key = k.next().value;
             if (lobby == id){
                 lobbies.delete(key);
+                break;
+            }
+        }
+    }
+
+    if (games.length > 0){
+        for (let i = 0; i < games.length; i++) {
+            const element = games[i];
+            if (element.player1 == id || element.player2 == id){
+
+                games.splice(i, 1);
+                break;
+            }
+        }
+    }
+
+    if (rematches.length > 0){
+        for (let i = 0; i < rematches.length; i++) {
+            if (rematches[i].winner == id || rematches[i].loser == id){
+                server.send("server|server|opponent-disconnect|opponent refused rematch", clients.get(rematches[i].winner).port, clients.get(rematches[i].winner).ip);
+                server.send("server|server|opponent-disconnect|opponent refused rematch", clients.get(rematches[i].loser).port, clients.get(rematches[i].loser).ip);
+                rematches.splice(i, 1);
                 break;
             }
         }
@@ -177,7 +320,7 @@ server.on('error', (e) => {
 });
 
 server.on('message', (msg, rinfo) => {
-    console.log('server got: '+msg+' from '+rinfo.address+':'+rinfo.port);
+    //console.log('server got: '+msg+' from '+rinfo.address+':'+rinfo.port);
     var parsedMsg = parseMessage(msg, rinfo.address, rinfo.port);
     
     if (validateMessage(parsedMsg)){
@@ -192,8 +335,18 @@ server.on('message', (msg, rinfo) => {
                 break;
             case ServerEvent.endGame:
                 server_end_game(parsedMsg);
+                break;
             case ServerEvent.update:
                 server_update(parsedMsg);
+                break;
+            case ServerEvent.cancel:
+                server_cancel(parsedMsg);
+                break;
+            case ServerEvent.randomQueue:
+                randomQueue(parsedMsg);
+                break;
+            case ServerEvent.rematch:
+                server_rematch(parsedMsg);
                 break;
             default:
                 break;
